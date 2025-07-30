@@ -1,0 +1,32 @@
+services:
+  backend:
+    build: ./backend
+    container_name: attendance_backend
+    restart: unless-stopped
+    ports:
+      - "5002:5001"
+    environment:
+      - NODE_ENV=production
+      - PORT=5001
+      - MONGODB_URI=
+      - JWT_SECRET=your_super_secret_jwt_key_here_change_in_production
+    networks:
+      - attendance_network
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+  frontend:
+    build: ./frontend
+    container_name: attendance_frontend
+    restart: unless-stopped
+    ports:
+      - "3002:80"
+    depends_on:
+      - backend
+    networks:
+      - attendance_network
+
+networks:
+  attendance_network:
+    driver: bridge
