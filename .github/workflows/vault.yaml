@@ -1,0 +1,102 @@
+name: Build & Run Locally (Self-hosted)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-run:
+    runs-on: self-hosted
+    env:
+      # From your repo secrets
+      VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+      VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+      BACKEND_IMAGE: backend:latest
+      FRONTEND_IMAGE: frontend:latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install jq (if missing)
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+          jq --version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        run: docker build -t "$BACKEND_IMAGE" ./backend
+
+      - name: Build frontend image
+        run: docker build -t "$FRONTEND_IMAGE" ./frontend
+
+      - name: Fetch secrets from Vault (HTTP API)
+        run: |
+          set -euo pipefail
+
+          RESP="$(curl -sS --fail \
+            -H "X-Vault-Token: ${VAULT_TOKEN}" \
+            "${VAULT_ADDR}/v1/secret/data/myapp/config")"
+
+          PORT="$(echo "$RESP" | jq -r '.data.data.PORT')"
+          MONGODB_URI="$(echo "$RESP" | jq -r '.data.data.MONGODB_URI')"
+          JWT_SECRET="$(echo "$RESP" | jq -r '.data.data.JWT_SECRET')"
+
+          # Basic checks
+          [ -n "$PORT" ] && [ "$PORT" != "null" ] || { echo "PORT missing in Vault"; exit 1; }
+
+          # Runtime-only env file (NOT committed)
+          cat > .env.runtime <<EOF
+          PORT=${PORT}
+          MONGODB_URI=${MONGODB_URI}
+          JWT_SECRET=${JWT_SECRET}
+          EOF
+
+          # Export for later steps too
+          echo "PORT=${PORT}" >> $GITHUB_ENV
+          echo "MONGODB_URI=${MONGODB_URI}" >> $GITHUB_ENV
+          echo "JWT_SECRET=${JWT_SECRET}" >> $GITHUB_ENV
+
+      - name: Create Docker network
+        run: docker network create app-network || true
+
+      - name: Stop previous containers (if any)
+        run: |
+          docker rm -f backend || true
+          docker rm -f frontend || true
+
+      - name: Run backend container (inject secrets at runtime)
+        run: |
+          docker run -d \
+            --name backend \
+            --network app-network \
+            -p 5001:5001 \
+            --env-file .env.runtime \
+            "$BACKEND_IMAGE"
+
+      - name: Run frontend container
+        run: |
+          docker run -d \
+            --name frontend \
+            --network app-network \
+            -p 3000:80 \
+            "$FRONTEND_IMAGE"
+
+      - name: Health check (backend)
+        run: |
+          for i in {1..12}; do
+            if curl -fsS http://localhost:5001/health >/dev/null 2>&1; then
+              echo "Backend healthy"
+              exit 0
+            fi
+            echo "Waiting for backend... ($i)"
+            sleep 5
+          done
+          echo "Backend did not become healthy in time"
+          exit 1
